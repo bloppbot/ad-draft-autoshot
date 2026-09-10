@@ -1,57 +1,50 @@
 param(
     [string]$OutPath = "",
-    [switch]$Calibrate,          # capture the screen right now, draw all detection boxes into calibration.png, print what is recognized
-    [string]$TestImage = "",     # use a PNG/JPG instead of the live screen (with -Calibrate), for checking geometry on a saved screenshot
-    [string]$TestBoard = "",     # with -TestImage: also treat the image as the draft board and run the name reading on it
-    [switch]$SwapDemo            # with -Calibrate -TestImage: exchange the name strips of Radiant cards 1 and 3 and save swap_demo.png
+    [string]$SteamApiKey = "",   # or put "SteamApiKey" into autoshot-b.config.json
+    [switch]$Calibrate,          # capture the screen now, draw the card boxes into calibration.png, print the hero names read
+    [string]$TestImage = "",     # with -Calibrate: use a saved screenshot instead of the live screen
+    [string]$RosterBefore = "",  # with -Calibrate -TestImage: a saved GetRealtimeStats JSON (before swaps) ...
+    [string]$RosterAfter = ""    # ... and one after swaps; runs the whole correction on the test image
 )
 
 # ============================================================================
-#  AD Draft AutoShot  B  (swap-aware)
+#  AD Draft AutoShot  B  (swap correction via Steam Web API)
 #
 #  A: the moment Dota flips from drafting to STRATEGY TIME the screen is
-#     captured into screenshot.png (same as the original AutoShot).
-#  B: hero swaps that happen after that (strategy time, pre-game, up to the
-#     horn) are detected from the hero portraits in the top bar and the
-#     PLAYER NAMES in screenshot.png are exchanged accordingly, so the board
-#     your overlay shows stays correct. No API key, no internet during the
-#     game (hero portraits are downloaded once from Valve's CDN), pure
-#     Windows PowerShell.
+#     captured into screenshot.png, exactly like the original AutoShot.
+#     That capture is the clean board (once players start swapping, the
+#     board on screen goes wrong, so it must be taken right away).
+#  B: from that moment until the horn, the live roster of the match is
+#     pulled from Valve's API every few seconds (which player has which
+#     hero). When two players trade heroes, the two PLAYER NAMES are
+#     exchanged inside screenshot.png. The overlay keeps showing the same
+#     file, now correct.
 #
-#  How the correction works:
-#    1. Draft board capture (strategy time) -> screenshot.png + screenshot.base.png
-#       The board is read once: hero name per card (Windows OCR, English UI).
-#    2. From PRE-GAME on, every few seconds the ten top-bar portraits are
-#       matched against the hero art. The first reading is the baseline.
-#    3. If two portraits of the same team trade places, the two players swapped.
-#       The name strips of those two cards are exchanged in screenshot.png.
-#    4. One last reading at the horn, then it stops until the next draft.
+#  Needs: a free Steam Web API key (https://steamcommunity.com/dev/apikey)
+#  and the streamer's Steam profile with public "Game details" (that is how
+#  the match's game server id is found). Pure Windows PowerShell otherwise.
 # ============================================================================
 
 $Port = 3211
 $DelayMs = 500              # wait after the phase flip before capturing the board
 $CooldownSec = 60           # ignore repeated STRATEGY_TIME flips for this long
-$PollSec = 3                # top-bar reading interval during pre-game
+$RosterPollSec = 5          # Steam API polling interval while swaps are possible
 $MaxWatchSec = 900          # safety stop for the watcher
-$HudCenterOffset = 0        # px; only if your HUD is not centered on the primary monitor
-$AssumeBoardOrderMatchesTopBar = $false   # $true = skip OCR, trust that card order == top-bar order (see README)
-$MinSlotScore = 0.45        # portrait match acceptance
-$MinSlotMargin = 0.04       # best minus second best
-$DebugImages = $true        # write debug_topbar.png / debug_board.png next to the screenshot
+$SteamId64 = ""             # streamer's steam64; empty = taken from Dota's GSI "player" block automatically
+$ExtraSteamIds = @()        # fallback steam64s of teammates with public game details, tried if the streamer's is private
+$HudCenterOffset = 0        # px; only if the game UI is not centered on the primary monitor
+$AssumeBoardOrderMatchesRoster = $false   # $true = skip OCR, trust that card order == team slot order (see README)
+$DebugImages = $true        # write debug_board.png next to the screenshot
 
 $Strategy = "DOTA_GAMERULES_STATE_STRATEGY_TIME"
 $PreGame  = "DOTA_GAMERULES_STATE_PRE_GAME"
 $InGame   = "DOTA_GAMERULES_STATE_GAME_IN_PROGRESS"
 $HeroSel  = "DOTA_GAMERULES_STATE_HERO_SELECTION"
 
-# ---- layout, in units of screen HEIGHT, x relative to the HUD center --------
-# Measured on 16:9 captures. Dota scales its HUD with the screen height and
-# centers it, so the same numbers hold for 1080p, 1440p and 4K. Run
-# .\autoshot-b.ps1 -Calibrate during a game to verify on your machine.
+# ---- board layout, in units of screen HEIGHT, x relative to the screen center --
+# Measured on 16:9 captures. Dota scales its UI with the height and centers
+# it, so the numbers hold for 1080p, 1440p and 4K. -Calibrate shows the boxes.
 $L = @{
-    TopSlotW      = 0.0550;  TopSlotH = 0.0285;  TopPitch = 0.0578;  TopY = 0.0
-    TopRadiantX   = -0.386;  TopDireX = 0.102
-    ArtS = 0.90; ArtCX = 0.50; ArtCY = 0.60      # which part of the 256x144 hero art the top bar shows
     RowTop0 = 0.1426; RowPitch = 0.1562           # first card top, card to card distance
     HeroNameY = -0.006; HeroNameH = 0.034         # hero name text, relative to card top
     RadHeroNameX0 = -0.700; RadHeroNameX1 = -0.470
@@ -64,19 +57,19 @@ $L = @{
 if ($OutPath -eq "") { $OutPath = Join-Path $PSScriptRoot "screenshot.png" }
 $BasePath = [System.IO.Path]::ChangeExtension($OutPath, ".base.png")
 $ConfigPath = Join-Path $PSScriptRoot "autoshot-b.config.json"
-$CacheDir = Join-Path $env:LOCALAPPDATA "ad-draft-autoshot\heroes"
 $HeroListPath = Join-Path $PSScriptRoot "heroes.json"
 
-# optional overrides from autoshot-b.config.json
 if (Test-Path $ConfigPath) {
     try {
         $cfg = Get-Content $ConfigPath -Raw | ConvertFrom-Json
         foreach ($p in $cfg.PSObject.Properties) {
             if ($p.Name -eq "Layout") { foreach ($q in $p.Value.PSObject.Properties) { $L[$q.Name] = [double]$q.Value } }
+            elseif ($p.Name -eq "SteamApiKey") { if ($SteamApiKey -eq "") { $SteamApiKey = [string]$p.Value } }
             elseif (Get-Variable -Name $p.Name -Scope Script -ErrorAction SilentlyContinue) { Set-Variable -Name $p.Name -Value $p.Value -Scope Script }
         }
     } catch { Write-Host "config file ignored: $($_.Exception.Message)" }
 }
+$ExtraSteamIds = @($ExtraSteamIds | ForEach-Object { [string]$_ } | Where-Object { $_ -ne "" })
 
 Add-Type -AssemblyName System.Windows.Forms
 Add-Type -AssemblyName System.Drawing
@@ -92,68 +85,34 @@ using System.Drawing.Imaging;
 using System.Runtime.InteropServices;
 public static class AdShot {
     [DllImport("user32.dll")] public static extern bool SetProcessDPIAware();
-
     public static Bitmap Capture() {
         var b = System.Windows.Forms.Screen.PrimaryScreen.Bounds;
         var bmp = new Bitmap(b.Width, b.Height, PixelFormat.Format24bppRgb);
         using (var g = Graphics.FromImage(bmp)) g.CopyFromScreen(b.Location, Point.Empty, b.Size);
         return bmp;
     }
-    static Bitmap Resample(Image src, Rectangle r, int w, int h) {
-        var o = new Bitmap(w, h, PixelFormat.Format24bppRgb);
+    public static Bitmap CropScale(Image src, Rectangle r, int scale) {
+        var o = new Bitmap(r.Width * scale, r.Height * scale, PixelFormat.Format24bppRgb);
         using (var g = Graphics.FromImage(o)) {
-            g.InterpolationMode = InterpolationMode.HighQualityBilinear;
+            g.InterpolationMode = InterpolationMode.HighQualityBicubic;
             g.PixelOffsetMode = PixelOffsetMode.HighQuality;
-            g.DrawImage(src, new Rectangle(0, 0, w, h), r, GraphicsUnit.Pixel);
+            g.DrawImage(src, new Rectangle(0, 0, o.Width, o.Height), r, GraphicsUnit.Pixel);
         }
         return o;
     }
-    // zero-mean, unit-norm RGB vector of a region, bottom-left corner masked (level/icon overlays)
-    public static float[] Feat(Image src, Rectangle r, int fw, int fh) {
-        using (var s = Resample(src, r, fw, fh)) {
-            var f = new float[fw * fh * 3]; int k = 0; double sum = 0; int n = 0;
-            for (int y = 0; y < fh; y++) for (int x = 0; x < fw; x++) {
-                bool masked = (y >= fh * 0.6 && x < fw * 0.3);
-                var c = s.GetPixel(x, y);
-                float[] v = { c.R, c.G, c.B };
-                for (int i = 0; i < 3; i++) { f[k++] = masked ? float.NaN : v[i]; if (!masked) { sum += v[i]; n++; } }
-            }
-            double mean = n > 0 ? sum / n : 0; double ss = 0;
-            for (int i = 0; i < f.Length; i++) { if (float.IsNaN(f[i])) f[i] = 0; else { f[i] -= (float)mean; ss += f[i] * f[i]; } }
-            float norm = (float)Math.Sqrt(ss); if (norm < 1e-6f) norm = 1e-6f;
-            for (int i = 0; i < f.Length; i++) f[i] /= norm;
-            return f;
-        }
-    }
-    // the same for a window of the hero art (s = fraction of art width shown, cx/cy = window center)
-    public static float[] FeatFromArt(Image art, double s, double cx, double cy, double aspect, int fw, int fh) {
-        double cw = art.Width * s, ch = cw / aspect;
-        if (ch > art.Height) { ch = art.Height; cw = ch * aspect; }
-        double l = cx * art.Width - cw / 2, t = cy * art.Height - ch / 2;
-        l = Math.Max(0, Math.Min(art.Width - cw, l)); t = Math.Max(0, Math.Min(art.Height - ch, t));
-        return Feat(art, new Rectangle((int)Math.Round(l), (int)Math.Round(t), (int)Math.Round(cw), (int)Math.Round(ch)), fw, fh);
-    }
-    public static double Dot(float[] a, float[] b) { double d = 0; for (int i = 0; i < a.Length; i++) d += a[i] * b[i]; return d; }
-    // returns {bestIndex, bestScore, secondScore}
-    public static double[] Best(float[] f, float[][] refs) {
-        int bi = -1; double b1 = -2, b2 = -2;
-        for (int i = 0; i < refs.Length; i++) { double d = Dot(f, refs[i]); if (d > b1) { b2 = b1; b1 = d; bi = i; } else if (d > b2) b2 = d; }
-        return new double[] { bi, b1, b2 };
-    }
-    public static void SwapRects(Bitmap img, Rectangle a, Rectangle b) {
-        using (var ca = img.Clone(a, img.PixelFormat)) using (var cb = img.Clone(b, img.PixelFormat)) using (var g = Graphics.FromImage(img)) {
-            g.CompositingMode = CompositingMode.SourceCopy;
-            g.DrawImage(cb, a); g.DrawImage(ca, b);
-        }
-    }
-    public static Bitmap CropScale(Image src, Rectangle r, int scale) { return Resample(src, r, r.Width * scale, r.Height * scale); }
-    public static Bitmap Contrast(Bitmap src) {   // grayscale, stretched, for OCR of stylized text
+    public static Bitmap Contrast(Bitmap src) {   // grayscale, stretched, inverted: helps OCR on stylized text
         var o = new Bitmap(src.Width, src.Height, PixelFormat.Format24bppRgb);
         int lo = 255, hi = 0;
         for (int y = 0; y < src.Height; y++) for (int x = 0; x < src.Width; x++) { var c = src.GetPixel(x, y); int v = Math.Max(c.R, Math.Max(c.G, c.B)); if (v < lo) lo = v; if (v > hi) hi = v; }
         if (hi - lo < 10) hi = lo + 10;
         for (int y = 0; y < src.Height; y++) for (int x = 0; x < src.Width; x++) { var c = src.GetPixel(x, y); int v = Math.Max(c.R, Math.Max(c.G, c.B)); v = (int)Math.Round(255.0 * (v - lo) / (hi - lo)); v = 255 - Math.Max(0, Math.Min(255, v)); o.SetPixel(x, y, Color.FromArgb(v, v, v)); }
         return o;
+    }
+    public static void SwapRects(Bitmap img, Rectangle a, Rectangle b) {
+        using (var ca = img.Clone(a, img.PixelFormat)) using (var cb = img.Clone(b, img.PixelFormat)) using (var g = Graphics.FromImage(img)) {
+            g.CompositingMode = CompositingMode.SourceCopy;
+            g.DrawImage(cb, a); g.DrawImage(ca, b);
+        }
     }
     public static void DrawRect(Bitmap img, Rectangle r, Color c, string label) {
         using (var g = Graphics.FromImage(img)) using (var p = new Pen(c, 2)) using (var f = new Font("Arial", 10, FontStyle.Bold)) using (var br = new SolidBrush(c)) {
@@ -175,51 +134,17 @@ public static class AdShot {
 
 function Log($msg) { Write-Host ("[{0}] {1}" -f (Get-Date -Format HH:mm:ss), $msg) }
 
-# ---- hero list + art cache --------------------------------------------------
+# ---- hero list -------------------------------------------------------------------
 $Heroes = Get-Content $HeroListPath -Raw -Encoding UTF8 | ConvertFrom-Json
 function Norm($s) { return (($s.ToUpperInvariant()) -replace "[^A-Z]", "") }
-$HeroKeys = @{}; foreach ($h in $Heroes) { $HeroKeys[$h.name] = Norm $h.localized_name }
+$HeroKeys = @{}; $HeroById = @{}
+foreach ($h in $Heroes) { $HeroKeys[$h.name] = Norm $h.localized_name; $HeroById[[int]$h.id] = $h.name }
+function Hero-Name($id) { if ($HeroById.ContainsKey([int]$id)) { return $HeroById[[int]$id] }; return "hero$id" }
 
-function Ensure-HeroArt {
-    if (-not (Test-Path $CacheDir)) { New-Item -ItemType Directory -Force $CacheDir | Out-Null }
-    $missing = @($Heroes | Where-Object { -not (Test-Path (Join-Path $CacheDir ($_.name + ".png"))) })
-    if ($missing.Count -gt 0) {
-        Log "downloading $($missing.Count) hero portraits from Valve's CDN (one time, ~8 MB)..."
-        foreach ($h in $missing) {
-            $url = "https://cdn.cloudflare.steamstatic.com/apps/dota2/images/dota_react/heroes/$($h.name).png"
-            try { Invoke-WebRequest -Uri $url -OutFile (Join-Path $CacheDir ($h.name + ".png")) -UseBasicParsing -TimeoutSec 30 }
-            catch { Log "  failed: $($h.name) ($($_.Exception.Message))" }
-        }
-    }
-}
-
-$FW = 24; $FH = 12
-$RefNames = New-Object System.Collections.ArrayList
-$RefFeats = New-Object System.Collections.ArrayList
-function Build-Refs {
-    $aspect = $L.TopSlotW / $L.TopSlotH
-    foreach ($h in $Heroes) {
-        $p = Join-Path $CacheDir ($h.name + ".png"); if (-not (Test-Path $p)) { continue }
-        try {
-            $img = [System.Drawing.Image]::FromFile($p)
-            [void]$RefFeats.Add([AdShot]::FeatFromArt($img, $L.ArtS, $L.ArtCX, $L.ArtCY, $aspect, $FW, $FH)); [void]$RefNames.Add($h.name)
-            $img.Dispose()
-        } catch { Log "  bad art file $p ($($_.Exception.Message))" }
-    }
-    Log "hero portraits ready: $($RefNames.Count)"
-    if ($RefNames.Count -lt 100) { throw "hero portraits missing or unreadable in $CacheDir (delete the folder to re-download)" }
-}
-
-# ---- geometry ---------------------------------------------------------------
+# ---- geometry ----------------------------------------------------------------------
 function Geo($W, $H) {
     $cx = [double]$W / 2 + $HudCenterOffset
-    $g = @{ W = $W; H = $H; Slots = @(); Rows = @() }
-    for ($i = 0; $i -lt 10; $i++) {
-        $team = 0; if ($i -ge 5) { $team = 1 }
-        $x0 = $L.TopRadiantX; if ($team -eq 1) { $x0 = $L.TopDireX }
-        $x = $cx + ($x0 + ($i % 5) * $L.TopPitch) * $H
-        $g.Slots += New-Object System.Drawing.Rectangle([int][math]::Round($x), [int][math]::Round($L.TopY * $H), [int][math]::Round($L.TopSlotW * $H), [int][math]::Round($L.TopSlotH * $H))
-    }
+    $g = @{ W = $W; H = $H; Rows = @() }
     for ($t = 0; $t -lt 2; $t++) {
         for ($r = 0; $r -lt 5; $r++) {
             $top = ($L.RowTop0 + $r * $L.RowPitch) * $H
@@ -235,7 +160,7 @@ function Geo($W, $H) {
     return $g
 }
 
-# ---- OCR (Windows built-in) -------------------------------------------------
+# ---- OCR (Windows built-in) ----------------------------------------------------------
 $OcrOk = $false
 try {
     $null = [Windows.Media.Ocr.OcrEngine, Windows.Foundation, ContentType = WindowsRuntime]
@@ -248,7 +173,6 @@ try {
 } catch { $OcrOk = $false }
 function Await($op, $type) { $t = $script:AsTask.MakeGenericMethod($type).Invoke($null, @($op)); $t.Wait(); $t.Result }
 function Ocr-Lines([System.Drawing.Bitmap]$bmp) {
-    # returns @( @{Text; X; Y; W; H} ) in the bitmap's own pixels
     $tmp = Join-Path $env:TEMP ("adshot_ocr_" + [guid]::NewGuid().ToString("N") + ".png")
     $bmp.Save($tmp, [System.Drawing.Imaging.ImageFormat]::Png)
     $out = @()
@@ -277,25 +201,21 @@ function Match-HeroName($text) {
     }
     $allow = [math]::Max(1, [math]::Floor($n.Length * 0.34))
     if ($b1 -le $allow -and $b2 -gt $b1) { return $best }
-    # a cut-off first word ("STORM" for STORM SPIRIT): accept a unique prefix of 5+ letters
-    if ($n.Length -ge 5) {
+    if ($n.Length -ge 5) {   # a cut-off first word ("STORM" for STORM SPIRIT): accept a unique prefix
         $pref = @($HeroKeys.Keys | Where-Object { $HeroKeys[$_].StartsWith($n) })
         if ($pref.Count -eq 1) { return $pref[0] }
     }
     return $null
 }
 
-# ---- board reading ------------------------------------------------------------
+# ---- board reading: which hero is on which card ------------------------------------------
 function Read-Board([System.Drawing.Bitmap]$img, $g) {
-    # returns hashtable heroName -> row (Team, Index, NameRect)
-    $map = @{}
-    if ($AssumeBoardOrderMatchesTopBar) { Log "board: OCR skipped (AssumeBoardOrderMatchesTopBar)"; return $map }
+    $map = @{}   # heroName -> row
+    if ($AssumeBoardOrderMatchesRoster) { Log "board: OCR skipped (AssumeBoardOrderMatchesRoster)"; return $map }
     if (-not $OcrOk) { Log "board: Windows OCR not available, swap correction disabled"; return $map }
     $dbg = $null; if ($DebugImages) { $dbg = New-Object System.Drawing.Bitmap($img) }
-    $found = @{}   # "team-index" -> hero
-    $seen = @{}
-    # pass 1: one OCR per team column, lines assigned to cards by their vertical position
-    foreach ($t in 0, 1) {
+    $found = @{}; $seen = @{}
+    foreach ($t in 0, 1) {   # pass 1: one OCR per team column, lines assigned to cards by vertical position
         $rows = @($g.Rows | Where-Object { $_.Team -eq $t })
         $first = $rows[0].HeroRect; $last = $rows[4].HeroRect
         $col = New-Object System.Drawing.Rectangle($first.X, [math]::Max(0, $first.Y - 4), $first.Width, ($last.Bottom + 4 - [math]::Max(0, $first.Y - 4)))
@@ -316,13 +236,14 @@ function Read-Board([System.Drawing.Bitmap]$img, $g) {
             if (@($found.Keys | Where-Object { $_ -like "$t-*" }).Count -eq 5) { break }
         }
     }
-    # pass 2: cards still unknown get their own 3x crop, plain and contrast-stretched
-    foreach ($row in $g.Rows) {
+    foreach ($row in $g.Rows) {   # pass 2: unknown cards get their own crops (3x, 3x contrast, 4x padded, 4x padded contrast)
         $key = "$($row.Team)-$($row.Index)"
         if ($found.ContainsKey($key)) { continue }
-        foreach ($variant in 0, 1) {
-            $crop = [AdShot]::CropScale($img, $row.HeroRect, 3)
-            if ($variant -eq 1) { $c2 = [AdShot]::Contrast($crop); $crop.Dispose(); $crop = $c2 }
+        $pad = [int]($g.H * 0.008)
+        $padded = New-Object System.Drawing.Rectangle([math]::Max(0, $row.HeroRect.X - $pad), [math]::Max(0, $row.HeroRect.Y - $pad), ($row.HeroRect.Width + 2 * $pad), ($row.HeroRect.Height + 2 * $pad))
+        foreach ($variant in 0, 1, 2, 3) {
+            if ($variant -lt 2) { $crop = [AdShot]::CropScale($img, $row.HeroRect, 3) } else { $crop = [AdShot]::CropScale($img, $padded, 4) }
+            if ($variant % 2 -eq 1) { $c2 = [AdShot]::Contrast($crop); $crop.Dispose(); $crop = $c2 }
             $txt = ""; try { $txt = Ocr-Text $crop } catch { $txt = "" }
             $crop.Dispose()
             foreach ($line in ($txt -split "[\r\n]+")) { if ($line.Trim() -ne "") { $seen[$key] += "|" + $line.Trim(); $m = Match-HeroName $line; if ($m) { $found[$key] = $m; break } } }
@@ -341,41 +262,57 @@ function Read-Board([System.Drawing.Bitmap]$img, $g) {
     return $map
 }
 
-# ---- top bar reading ------------------------------------------------------------
-function Read-TopBar([System.Drawing.Bitmap]$img, $g, [bool]$debug) {
-    # returns array of 10 hashtables {Hero, Score, Second}
-    $out = @()
-    $refs = [float[][]]$RefFeats.ToArray()
-    $px = [math]::Max(1, [int][math]::Round($g.H / 540.0))   # search step in px
-    $dbg = $null; if ($debug) { $dbg = New-Object System.Drawing.Bitmap($img) }
-    for ($i = 0; $i -lt 10; $i++) {
-        $r = $g.Slots[$i]; $best = @(-1, -2, -2); $bestRect = $r
-        foreach ($dx in @(-2, -1, 0, 1, 2)) { foreach ($dy in @(0, 1)) { foreach ($dw in @(0, 1)) {
-            $rr = New-Object System.Drawing.Rectangle(($r.X + $dx * $px), ($r.Y + $dy * $px), ($r.Width + $dw * $px), $r.Height)
-            if ($rr.X -lt 0 -or $rr.Y -lt 0 -or $rr.Right -gt $g.W -or $rr.Bottom -gt $g.H) { continue }
-            $f = [AdShot]::Feat($img, $rr, $FW, $FH)
-            $b = [AdShot]::Best($f, $refs)
-            if ($b[1] -gt $best[1]) { $best = $b; $bestRect = $rr }
-        } } }
-        $hero = $null
-        if ($best[0] -ge 0 -and $best[1] -ge $MinSlotScore -and ($best[1] - $best[2]) -ge $MinSlotMargin) { $hero = $RefNames[[int]$best[0]] }
-        $out += @{ Hero = $hero; Score = [math]::Round($best[1], 2); Second = [math]::Round($best[2], 2); Cand = $RefNames[[int][math]::Max(0, $best[0])] }
-        if ($dbg) { $lab = "?"; if ($hero) { $lab = $hero }; $col = [System.Drawing.Color]::Lime; if (-not $hero) { $col = [System.Drawing.Color]::Red }; [AdShot]::DrawRect($dbg, $bestRect, $col, ("{0} {1}" -f $lab, [math]::Round($best[1], 2))) }
+# ---- Steam Web API ------------------------------------------------------------------------------
+function Steam-Get($url) { return Invoke-RestMethod -Uri $url -Method Get -TimeoutSec 15 -UseBasicParsing }
+function Get-ServerId {
+    # game server steam id of the match one of the known players is in; needs public "Game details" on that profile
+    $ids = @(); if ($script:LocalSteamId) { $ids += $script:LocalSteamId }; if ($SteamId64 -ne "") { $ids += $SteamId64 }; $ids += $ExtraSteamIds
+    $ids = @($ids | Select-Object -Unique); if ($ids.Count -eq 0) { return $null }
+    try {
+        $r = Steam-Get ("https://api.steampowered.com/ISteamUser/GetPlayerSummaries/v2/?key=$SteamApiKey&steamids=" + ($ids -join ","))
+        foreach ($p in $r.response.players) {
+            $sid = [string]$p.gameserversteamid
+            if ($sid -and $sid -ne "0" -and [string]$p.gameid -eq "570") { return $sid }
+        }
+    } catch {
+        $m = $_.Exception.Message; if ($m -match "403") { $m += " (403 = the Steam API key is wrong)" }
+        Log "GetPlayerSummaries failed: $m"
     }
-    if ($dbg) { $dbg.Save((Join-Path (Split-Path $OutPath) "debug_topbar.png"), [System.Drawing.Imaging.ImageFormat]::Png); $dbg.Dispose() }
-    return $out
+    return $null
 }
-function Fmt-Slots($slots) {
-    $a = @(); for ($i = 0; $i -lt 10; $i++) { $h = $slots[$i].Hero; if (-not $h) { $h = "?(" + $slots[$i].Cand + " " + $slots[$i].Score + ")" }; $a += $h }
-    return ("R: " + ($a[0..4] -join ", ") + "  |  D: " + ($a[5..9] -join ", "))
+function Parse-Roster($json) {
+    # -> array of @{Account; Name; Team(0 radiant/1 dire); Hero(name); HeroId; Slot}, or $null if not a complete 10-player roster
+    $players = @()
+    foreach ($team in @($json.teams)) {
+        $t = -1; if ([int]$team.team_number -eq 2) { $t = 0 } elseif ([int]$team.team_number -eq 3) { $t = 1 }
+        if ($t -lt 0) { continue }
+        $slot = 0
+        foreach ($p in @($team.players)) {
+            $hid = 0; try { $hid = [int]$p.heroid } catch { $hid = 0 }
+            $players += @{ Account = [string]$p.accountid; Name = [string]$p.name; Team = $t; HeroId = $hid; Hero = (Hero-Name $hid); Slot = $slot }
+            $slot++
+        }
+    }
+    if ($players.Count -ne 10) { return $null }
+    if (@($players | Where-Object { $_.HeroId -le 0 }).Count -gt 0) { return $null }
+    return $players
+}
+function Get-Roster($serverId) {
+    try {
+        $r = Steam-Get "https://api.steampowered.com/IDOTA2MatchStats_570/GetRealtimeStats/v1/?key=$SteamApiKey&server_steam_id=$serverId"
+        return (Parse-Roster $r)
+    } catch { Log "GetRealtimeStats failed: $($_.Exception.Message)"; return $null }
+}
+function Fmt-Roster($ros) {
+    $a = @($ros | Where-Object { $_.Team -eq 0 } | ForEach-Object { "$($_.Name)=$($_.Hero)" }); $b = @($ros | Where-Object { $_.Team -eq 1 } | ForEach-Object { "$($_.Name)=$($_.Hero)" })
+    return ("R: " + ($a -join ", ") + "  |  D: " + ($b -join ", "))
 }
 
-# ---- screenshot + correction state --------------------------------------------
+# ---- correction ------------------------------------------------------------------------------------
 $script:Game = $null
-function Save-Atomic([System.Drawing.Bitmap]$bmp, $path) {
-    $tmp = "$path.tmp"; $bmp.Save($tmp, [System.Drawing.Imaging.ImageFormat]::Png); Move-Item -Force $tmp $path
-}
-function Take-Board {
+$script:LocalSteamId = ""
+function Save-Atomic([System.Drawing.Bitmap]$bmp, $path) { $tmp = "$path.tmp"; $bmp.Save($tmp, [System.Drawing.Imaging.ImageFormat]::Png); Move-Item -Force $tmp $path }
+function Capture-Board {
     Start-Sleep -Milliseconds $DelayMs
     $bmp = [AdShot]::Capture()
     Save-Atomic $bmp $OutPath
@@ -384,93 +321,86 @@ function Take-Board {
     $g = Geo $bmp.Width $bmp.Height
     $rows = Read-Board $bmp $g
     $bmp.Dispose()
-    $script:Game = @{ Geo = $g; Rows = $rows; Baseline = $null; Swaps = @(); Pending = $null; Polls = 0; Started = Get-Date; Done = $false; Watching = $false }
+    $script:Game = @{ Geo = $g; Rows = $rows; ServerId = $null; Baseline = $null; Swaps = @(); Polls = 0; Started = Get-Date; Done = $false }
 }
-function Row-Of($hero, $slot) {
-    if ($AssumeBoardOrderMatchesTopBar) { return $script:Game.Geo.Rows[$slot] }
-    if ($hero -and $script:Game.Rows.ContainsKey($hero)) { return $script:Game.Rows[$hero] }
+function Row-Of($player) {
+    # the board card that belongs to a roster entry (by its hero at draft time, or by slot order)
+    if ($AssumeBoardOrderMatchesRoster) { return ($script:Game.Geo.Rows | Where-Object { $_.Team -eq $player.Team -and $_.Index -eq $player.Slot } | Select-Object -First 1) }
+    if ($script:Game.Rows.ContainsKey($player.Hero)) { return $script:Game.Rows[$player.Hero] }
     return $null
 }
 function Apply-Swaps {
-    # rebuild screenshot.png from the pristine board with every recorded swap applied
     $bmp = New-Object System.Drawing.Bitmap($BasePath)
     foreach ($s in $script:Game.Swaps) { [AdShot]::SwapRects($bmp, $s.A, $s.B) }
     Save-Atomic $bmp $OutPath; $bmp.Dispose()
     Log "screenshot.png rewritten with $($script:Game.Swaps.Count) name swap(s)"
 }
-function Poll-TopBar([bool]$final) {
-    $G = $script:Game; if ($null -eq $G -or $G.Done) { return }
-    $bmp = [AdShot]::Capture()
-    $slots = Read-TopBar $bmp $G.Geo ($DebugImages -and $G.Polls -eq 0)
-    $bmp.Dispose(); $G.Polls++
-    $known = @($slots | Where-Object { $_.Hero }).Count
+function Process-Roster($ros, [bool]$final) {
+    # compares the live roster with the draft-time baseline and exchanges names on the board for every traded pair
+    $G = $script:Game
     if ($null -eq $G.Baseline) {
-        $names = @($slots | Where-Object { $_.Hero } | ForEach-Object { $_.Hero })
-        $distinct = ($names | Select-Object -Unique).Count
-        if ($known -ge 8 -and $distinct -eq $names.Count) {
-            $G.Baseline = @(); for ($i = 0; $i -lt 10; $i++) { $G.Baseline += $slots[$i].Hero }
-            Log ("top bar baseline ({0}/10): {1}" -f $known, (Fmt-Slots $slots))
-            for ($i = 0; $i -lt 10; $i++) { if ($slots[$i].Hero -and -not (Row-Of $slots[$i].Hero $i)) { Log "  note: $($slots[$i].Hero) not found on the board reading, a swap involving it cannot be corrected" } }
-        } else { Log ("top bar not readable yet ({0}/10): {1}" -f $known, (Fmt-Slots $slots)) }
+        $G.Baseline = @{}; foreach ($p in $ros) { $G.Baseline[$p.Account] = $p }
+        Log ("roster baseline: " + (Fmt-Roster $ros))
+        foreach ($p in $ros) { if (-not (Row-Of $p)) { Log "  note: no board card found for $($p.Name) ($($p.Hero)); a swap involving this player cannot be corrected" } }
         return
     }
-    # detect exchanged pairs within a team
-    $pairs = @()
-    for ($i = 0; $i -lt 10; $i++) {
-        $ci = $slots[$i].Hero; $bi = $G.Baseline[$i]
-        if (-not $ci -or -not $bi -or $ci -eq $bi) { continue }
-        $t0 = 0; if ($i -ge 5) { $t0 = 5 }
-        for ($j = $i + 1; $j -lt $t0 + 5; $j++) {
-            if ($slots[$j].Hero -eq $bi -and $ci -eq $G.Baseline[$j]) { $pairs += ,@($i, $j) }
-        }
+    $changed = @($ros | Where-Object { $G.Baseline.ContainsKey($_.Account) -and $G.Baseline[$_.Account].HeroId -ne $_.HeroId })
+    if ($changed.Count -eq 0) { if ($final) { Log "final roster check: no swap" }; return }
+    $handled = @{}
+    foreach ($p in $changed) {
+        if ($handled.ContainsKey($p.Account)) { continue }
+        $bp = $G.Baseline[$p.Account]
+        $partner = $changed | Where-Object { $_.Account -ne $p.Account -and $_.Team -eq $p.Team -and $_.HeroId -eq $bp.HeroId -and $G.Baseline[$_.Account].HeroId -eq $p.HeroId } | Select-Object -First 1
+        if ($null -eq $partner) { Log "$($p.Name) changed $($bp.Hero) -> $($p.Hero) but no matching partner yet, waiting"; continue }
+        $bq = $G.Baseline[$partner.Account]
+        $ra = Row-Of $bp; $rb = Row-Of $bq
+        if ($null -eq $ra -or $null -eq $rb) { Log "SWAP: $($p.Name) <-> $($partner.Name) ($($bp.Hero) <-> $($bq.Hero)), but a board card is unknown, cannot correct" }
+        else { $G.Swaps += @{ A = $ra.NameRect; B = $rb.NameRect }; Log "SWAP: $($p.Name) now plays $($p.Hero), $($partner.Name) now plays $($partner.Hero) -> names exchanged on the board" }
+        # from now on these two are the baseline (so a swap back is detected too)
+        $G.Baseline[$p.Account] = @{ Account = $p.Account; Name = $p.Name; Team = $p.Team; HeroId = $p.HeroId; Hero = $p.Hero; Slot = $bp.Slot }
+        $G.Baseline[$partner.Account] = @{ Account = $partner.Account; Name = $partner.Name; Team = $partner.Team; HeroId = $partner.HeroId; Hero = $partner.Hero; Slot = $bq.Slot }
+        $handled[$p.Account] = $true; $handled[$partner.Account] = $true
+        Apply-Swaps
     }
-    if ($pairs.Count -eq 0) { $G.Pending = $null; if ($final) { Log ("final reading: no swap. " + (Fmt-Slots $slots)) }; return }
-    $key = ($pairs | ForEach-Object { "$($_[0])-$($_[1])" }) -join ","
-    if ($G.Pending -ne $key -and -not $final) { $G.Pending = $key; Log "possible swap seen ($key), confirming on next reading"; return }
-    foreach ($p in $pairs) {
-        $i = $p[0]; $j = $p[1]; $hi = $G.Baseline[$i]; $hj = $G.Baseline[$j]
-        $ri = Row-Of $hi $i; $rj = Row-Of $hj $j
-        if ($null -eq $ri -or $null -eq $rj) { Log "SWAP detected: $hi <-> $hj, but a board card is unknown, cannot correct"; }
-        else {
-            $G.Swaps += @{ A = $ri.NameRect; B = $rj.NameRect }
-            Log "SWAP detected: the player who drafted $hi now plays $hj (and vice versa) -> names exchanged on the board"
-        }
-        $G.Baseline[$i] = $hj; $G.Baseline[$j] = $hi
+}
+function Poll-Roster([bool]$final) {
+    $G = $script:Game; if ($null -eq $G -or $G.Done) { return }
+    $G.Polls++
+    if ($null -eq $G.ServerId) {
+        $G.ServerId = Get-ServerId
+        if ($null -eq $G.ServerId) { Log "match server not found yet (profile private, or Steam not reporting the game yet), retrying"; return }
+        Log "match server id: $($G.ServerId)"
     }
-    $G.Pending = $null
-    Apply-Swaps
+    $ros = Get-Roster $G.ServerId
+    if ($null -eq $ros) { Log "roster not complete yet, retrying"; return }
+    Process-Roster $ros $final
 }
 
-# ---- calibration / test mode ------------------------------------------------------
+# ---- calibration / test mode -------------------------------------------------------------------------
 if ($Calibrate) {
-    Ensure-HeroArt; Build-Refs
     if ($TestImage -ne "") { $bmp = New-Object System.Drawing.Bitmap($TestImage); Log "test image $TestImage ($($bmp.Width)x$($bmp.Height))" }
     else { Start-Sleep -Seconds 3; $bmp = [AdShot]::Capture(); Log "captured the screen ($($bmp.Width)x$($bmp.Height))" }
     $g = Geo $bmp.Width $bmp.Height
     $dbg = New-Object System.Drawing.Bitmap($bmp)
-    for ($i = 0; $i -lt 10; $i++) { [AdShot]::DrawRect($dbg, $g.Slots[$i], [System.Drawing.Color]::Lime, "slot $i") }
     foreach ($row in $g.Rows) { [AdShot]::DrawRect($dbg, $row.HeroRect, [System.Drawing.Color]::Yellow, "hero"); [AdShot]::DrawRect($dbg, $row.NameRect, [System.Drawing.Color]::Cyan, "name") }
     $calPath = Join-Path (Split-Path $OutPath) "calibration.png"; $dbg.Save($calPath, [System.Drawing.Imaging.ImageFormat]::Png); $dbg.Dispose()
-    Log "boxes drawn -> $calPath (green = top-bar portraits, yellow = hero name read, cyan = name strip that gets swapped)"
-    $slots = Read-TopBar $bmp $g $true
-    Log ("top bar reading: " + (Fmt-Slots $slots))
-    if ($TestImage -eq "" -or $TestBoard -ne "") {
-        $rows = Read-Board $bmp $g
-        Log ("board reading: {0} hero names recognized (OCR available: {1})" -f $rows.Count, $OcrOk)
-    }
-    if ($SwapDemo) {
-        $demo = New-Object System.Drawing.Bitmap($bmp)
-        [AdShot]::SwapRects($demo, $g.Rows[0].NameRect, $g.Rows[2].NameRect)
-        $demoPath = Join-Path (Split-Path $OutPath) "swap_demo.png"; $demo.Save($demoPath, [System.Drawing.Imaging.ImageFormat]::Png); $demo.Dispose()
-        Log "swap demo (Radiant card 1 <-> card 3 names) -> $demoPath"
+    Log "boxes drawn -> $calPath (yellow = hero name read, cyan = name strip that gets swapped)"
+    $rows = Read-Board $bmp $g
+    Log ("board reading: {0} hero names recognized (OCR available: {1})" -f $rows.Count, $OcrOk)
+    if ($RosterBefore -ne "" -and $RosterAfter -ne "") {
+        $bmp.Save($BasePath, [System.Drawing.Imaging.ImageFormat]::Png)
+        $script:Game = @{ Geo = $g; Rows = $rows; ServerId = "test"; Baseline = $null; Swaps = @(); Polls = 0; Started = Get-Date; Done = $false }
+        $r1 = Parse-Roster (Get-Content $RosterBefore -Raw | ConvertFrom-Json); $r2 = Parse-Roster (Get-Content $RosterAfter -Raw | ConvertFrom-Json)
+        if ($null -eq $r1 -or $null -eq $r2) { Log "test rosters not complete (10 players with heroid needed)" }
+        else { Process-Roster $r1 $false; Process-Roster $r2 $true; Log "test result -> $OutPath" }
     }
     $bmp.Dispose()
     exit 0
 }
 
-# ---- main loop ----------------------------------------------------------------------
-Ensure-HeroArt; Build-Refs
-if (-not $OcrOk -and -not $AssumeBoardOrderMatchesTopBar) { Log "WARNING: Windows OCR not available on this PC; screenshots still work, swap correction will not" }
+# ---- main loop -----------------------------------------------------------------------------------------
+if ($SteamApiKey -eq "") { Log "WARNING: no SteamApiKey (autoshot-b.config.json). Screenshots will work, swap correction will not." }
+if (-not $OcrOk -and -not $AssumeBoardOrderMatchesRoster) { Log "WARNING: Windows OCR not available on this PC; screenshots still work, swap correction will not" }
 
 $listener = New-Object System.Net.HttpListener
 $listener.Prefixes.Add("http://localhost:$Port/")
@@ -486,17 +416,23 @@ while ($listener.IsListening) {
         $body = (New-Object System.IO.StreamReader($ctx.Request.InputStream, $ctx.Request.ContentEncoding)).ReadToEnd()
         $ctx.Response.StatusCode = 200; $ctx.Response.Close()
         $state = $null
-        try { $data = $body | ConvertFrom-Json; if ($data -and $data.map) { $state = $data.map.game_state } } catch { $state = $null }
+        try {
+            $data = $body | ConvertFrom-Json
+            if ($data -and $data.map) { $state = $data.map.game_state }
+            if ($data -and $data.player -and $data.player.steamid) { $script:LocalSteamId = [string]$data.player.steamid }
+        } catch { $state = $null }
         if ($null -ne $state -and $state -ne $prevState) {
             if ($state -eq $Strategy) {
                 if (((Get-Date) - $lastShot).TotalSeconds -lt $CooldownSec) { Log "strategy time again within cooldown, ignoring" }
-                else { Log "$prevState -> $state : capturing in $($DelayMs)ms"; Take-Board; $lastShot = Get-Date }
-            }
-            elseif ($state -eq $PreGame -and $null -ne $script:Game -and -not $script:Game.Done) {
-                Log "pre-game: watching the top bar for hero swaps every $PollSec s"; $script:Game.Watching = $true; $nextPoll = (Get-Date).AddSeconds(1.5)
+                else {
+                    Log "$prevState -> $state : capturing in $($DelayMs)ms"
+                    try { Capture-Board } catch { Log "capture failed: $($_.Exception.Message)" }
+                    $lastShot = Get-Date
+                    if ($SteamApiKey -ne "" -and $null -ne $script:Game) { Log "watching the live roster every $RosterPollSec s until the horn"; $nextPoll = (Get-Date).AddSeconds(1) }
+                }
             }
             elseif ($state -eq $InGame -and $null -ne $script:Game -and -not $script:Game.Done) {
-                Log "horn: one final reading"; $finalDue = (Get-Date).AddSeconds(1.5); $nextPoll = [DateTime]::MaxValue
+                Log "horn: one final roster check"; $finalDue = (Get-Date).AddSeconds(4); $nextPoll = [DateTime]::MaxValue
             }
             elseif ($state -eq $HeroSel) { $script:Game = $null; $nextPoll = [DateTime]::MaxValue; $finalDue = [DateTime]::MaxValue; Log "game_state: $state (new draft)" }
             else { Log "game_state: $state" }
@@ -505,12 +441,12 @@ while ($listener.IsListening) {
     }
     $now = Get-Date
     if ($now -ge $nextPoll) {
-        try { Poll-TopBar $false } catch { Log "top bar reading failed: $($_.Exception.Message)" }
-        $nextPoll = $now.AddSeconds($PollSec)
+        try { Poll-Roster $false } catch { Log "roster check failed: $($_.Exception.Message)" }
+        $nextPoll = $now.AddSeconds($RosterPollSec)
         if ($null -ne $script:Game -and ($now - $script:Game.Started).TotalSeconds -gt $MaxWatchSec) { $script:Game.Done = $true; $nextPoll = [DateTime]::MaxValue; Log "watcher stopped (time limit)" }
     }
     if ($now -ge $finalDue) {
-        try { Poll-TopBar $true } catch { Log "final reading failed: $($_.Exception.Message)" }
+        try { Poll-Roster $true } catch { Log "final roster check failed: $($_.Exception.Message)" }
         $finalDue = [DateTime]::MaxValue
         if ($null -ne $script:Game) { $script:Game.Done = $true; Log "watcher done for this game ($($script:Game.Swaps.Count) swap(s) corrected)" }
     }
