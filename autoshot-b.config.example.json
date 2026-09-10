@@ -1,0 +1,9 @@
+{
+  "SteamApiKey": "PASTE-YOUR-STEAM-WEB-API-KEY-HERE",
+  "SteamId64": "",
+  "ExtraSteamIds": [],
+  "RosterPollSec": 5,
+  "HudCenterOffset": 0,
+  "AssumeBoardOrderMatchesRoster": false,
+  "DebugImages": true
+}
