@@ -12,16 +12,16 @@ Valve-provided feature for streamers).
 **Download:** click the green **Code** button above > **Download ZIP**, then
 unzip it anywhere.
 
-## Version B: swap-aware (new)
+## Version B: swap correction via the Steam Web API (new)
 
 Players can still swap heroes after the draft (strategy time, pre-game, up to
-the horn), which makes the captured board wrong. **Version B** keeps watching
-the top-bar portraits until the horn and, when two players trade heroes,
-exchanges their names inside `screenshot.png`. Same setup, same `.cfg`, no
-API key, no internet during the game. Run `start_autoshot-b.bat` instead of
-`start_autoshot.bat` and read **[README-B.md](README-B.md)**
-([по-русски](README-B.ru.md)). Version A below stays as the simple option.
-
+the horn), which makes the captured board wrong. **Version B** takes the same
+screenshot, then pulls the live roster of your match from Valve's API until
+the horn and, when two players trade heroes, exchanges their names inside
+`screenshot.png`. Needs a free Steam Web API key and public game details on
+your Steam profile. Run `start_autoshot-b.bat` instead of `start_autoshot.bat`
+and read **[README-B.md](README-B.md)** ([по-русски](README-B.ru.md)).
+Version A below stays as the simple option.
 
 ## Files
 
