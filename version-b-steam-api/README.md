@@ -29,9 +29,9 @@ Pure Windows PowerShell (Windows 10/11), nothing to install. What you need:
 - `start_autoshot-b.bat` - starts it. This is the only thing you run.
 - `autoshot-b.config.example.json` - copy to `autoshot-b.config.json` and paste your key
 - `heroes.json` - hero list (ids and names)
-- `gamestate_integration_autoshot.cfg` - the Dota config (goes into the Dota folder, see below). Version B's copy also reports your own steam id, so the tool finds your match by itself.
+- `gamestate_integration_autoshot.cfg` - the Dota config (goes into the Dota folder, see below). This copy differs from the standard one by one line: it also reports your own steam id, so the tool finds your match by itself.
 
-You can keep the original `autoshot.ps1` in the folder; just run only one of
+The standard version lives one folder up; run only one of
 the two listeners at a time (both use port 3211).
 
 ## Setup
@@ -43,8 +43,9 @@ the two listeners at a time (both use port 3211).
    your Steam Web API key into `SteamApiKey`.
 3. Dota config (one time): Steam > Library > right-click Dota 2 > Manage >
    Browse local files, then `game\dota\cfg\gamestate_integration\` (create the
-   folder if missing). Copy `gamestate_integration_autoshot.cfg` there
-   (overwrite the version A file, the new one has one extra line). Restart
+   folder if missing). Copy `gamestate_integration_autoshot.cfg` FROM THIS
+   FOLDER there (if the standard version's file is already in place, overwrite
+   it; this one has one extra line). Restart
    Dota if it was running.
 4. Double-click `start_autoshot-b.bat`. Leave the window open (minimized is
    fine).

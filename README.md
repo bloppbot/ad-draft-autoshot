@@ -12,17 +12,6 @@ Valve-provided feature for streamers).
 **Download:** click the green **Code** button above > **Download ZIP**, then
 unzip it anywhere.
 
-## Version B: swap correction via the Steam Web API (new)
-
-Players can still swap heroes after the draft (strategy time, pre-game, up to
-the horn), which makes the captured board wrong. **Version B** takes the same
-screenshot, then pulls the live roster of your match from Valve's API until
-the horn and, when two players trade heroes, exchanges their names inside
-`screenshot.png`. Needs a free Steam Web API key and public game details on
-your Steam profile. Run `start_autoshot-b.bat` instead of `start_autoshot.bat`
-and read **[README-B.md](README-B.md)** ([по-русски](README-B.ru.md)).
-Version A below stays as the simple option.
-
 ## Files
 
 - `autoshot.ps1` - the listener that waits for the phase change and takes the screenshot. Pure Windows PowerShell, nothing to install.
@@ -80,6 +69,22 @@ jumps to STRATEGY TIME you'll see "screenshot saved". Done.
 
 - `$DelayMs` - wait after the phase flip before capturing (default 500 ms)
 - `$CooldownSec` - re-trigger guard (default 60 s)
+
+## Optional: Version B (Steam Web API swap correction)
+
+Not needed for the normal setup. Players can still swap heroes after the draft
+(strategy time, pre-game, up to the horn), and the screenshot cannot know that.
+Version B takes the same screenshot, then asks Valve's Steam Web API for the
+live roster of your match until the horn and, when two players traded heroes,
+exchanges their two names inside `screenshot.png`.
+
+The difference in one line: the standard version is a screenshot and nothing
+else; Version B additionally needs a free Steam Web API key, "Game details =
+Public" on your Steam profile, and Dota in English. If you never care about
+post-draft swaps, ignore it.
+
+Everything for it is in the folder **[version-b-steam-api/](version-b-steam-api/)**
+with its own README (EN + RU). Run only one of the two listeners at a time.
 
 ---
 
